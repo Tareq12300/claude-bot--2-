@@ -72,6 +72,20 @@ TP_TARGETS = sorted(float(x) for x in env("TP_TARGETS", "20,40,60").split(",") i
 USE_LONG_FILTER  = env_bool("USE_LONG_FILTER", True)
 USE_SHORT_FILTER = env_bool("USE_SHORT_FILTER", True)
 USE_CLOSED_CANDLE_ONLY = env_bool("USE_CLOSED_CANDLE_ONLY", True)
+# أقل مدة (بالساعات) بين إشارتين لنفس العملة — لتقليل كثرة الإشارات
+SIGNAL_COOLDOWN_HOURS = env_float("SIGNAL_COOLDOWN_HOURS", 12.0)
+
+# فلتر القيمة السوقية (0 = تعطيل الحد) — يتطلب CMC_API_KEY
+MARKET_CAP_MIN = env_float("MARKET_CAP_MIN", 0.0)
+MARKET_CAP_MAX = env_float("MARKET_CAP_MAX", 0.0)
+
+# فلتر Stochastic RSI — الإشارة لا تُطلق إلا إذا كان %K بين الحدّين
+STOCH_RSI_MIN = env_float("STOCH_RSI_MIN", 0.0)
+STOCH_RSI_MAX = env_float("STOCH_RSI_MAX", 100.0)
+STOCH_RSI_LENGTH = env_int("STOCH_RSI_LENGTH", 14)   # طول RSI داخل الستوكاستك
+STOCH_LENGTH     = env_int("STOCH_LENGTH", 14)       # طول الستوكاستك
+STOCH_SMOOTH_K   = env_int("STOCH_SMOOTH_K", 3)
+STOCH_SMOOTH_D   = env_int("STOCH_SMOOTH_D", 3)
 
 CAPITAL  = env_float("CAPITAL", 1000.0)
 QUOTE    = env("QUOTE", "USDT")
@@ -175,6 +189,66 @@ def compute_rsi(closes, length):
     return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
 
 
+def compute_rsi_series(closes, length):
+    """سلسلة RSI كاملة (Wilder) — تبدأ من الشمعة رقم length."""
+    if len(closes) < length + 1:
+        return []
+    rsis = []
+    gains = losses = 0.0
+    for i in range(1, length + 1):
+        d = closes[i] - closes[i - 1]
+        gains += d if d >= 0 else 0
+        losses += -d if d < 0 else 0
+    ag, al = gains / length, losses / length
+    rsis.append(100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al))
+    for i in range(length + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (length - 1) + (d if d > 0 else 0)) / length
+        al = (al * (length - 1) + (-d if d < 0 else 0)) / length
+        rsis.append(100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al))
+    return rsis
+
+
+def compute_stoch_rsi(closes, rsi_len, stoch_len, k_smooth, d_smooth):
+    """Stochastic RSI — يرجّع (%K, %D) أو None."""
+    rsis = compute_rsi_series(closes, rsi_len)
+    if len(rsis) < stoch_len + k_smooth:
+        return None
+    raw = []
+    for i in range(stoch_len - 1, len(rsis)):
+        window = rsis[i - stoch_len + 1:i + 1]
+        lo, hi = min(window), max(window)
+        raw.append(0.0 if hi == lo else (rsis[i] - lo) / (hi - lo) * 100.0)
+    kline = [sum(raw[i - k_smooth + 1:i + 1]) / k_smooth
+             for i in range(k_smooth - 1, len(raw))]
+    if not kline:
+        return None
+    d = sum(kline[-d_smooth:]) / min(d_smooth, len(kline))
+    return (kline[-1], d)
+
+
+def stoch_in_range(k):
+    """هل %K للستوكاستك ضمن الحدّين؟ (الافتراضي 0..100 = بلا فلتر)"""
+    if STOCH_RSI_MIN <= 0 and STOCH_RSI_MAX >= 100:
+        return True
+    if k is None:
+        return False
+    return STOCH_RSI_MIN <= k <= STOCH_RSI_MAX
+
+
+def market_cap_in_range(mc):
+    """هل القيمة السوقية ضمن الحدّين؟ (0 = تعطيل الحد)"""
+    if MARKET_CAP_MIN <= 0 and MARKET_CAP_MAX <= 0:
+        return True
+    if mc is None:
+        return True   # لا توجد بيانات CMC للتقييم → لا نمنع الإشارة
+    if MARKET_CAP_MIN > 0 and mc < MARKET_CAP_MIN:
+        return False
+    if MARKET_CAP_MAX > 0 and mc > MARKET_CAP_MAX:
+        return False
+    return True
+
+
 def get_market_data(exchanges, symbol, timeframe, rsi_length, prefer=None):
     ordered = exchanges
     if prefer:
@@ -236,6 +310,16 @@ def fetch_cmc(base):
     except Exception as exc:
         print("خطأ CoinMarketCap:", exc)
         return None
+
+
+def get_cmc_cached(base, st, ttl=3600):
+    """بيانات CMC مع تخزين مؤقت لكل عملة (ساعة) لتقليل الطلبات."""
+    now = time.time()
+    if st.get("cmc_ts", 0) and (now - st["cmc_ts"]) < ttl:
+        return st.get("cmc")
+    data = fetch_cmc(base)
+    st["cmc"], st["cmc_ts"] = data, now
+    return data
 
 
 def now_str():
@@ -304,7 +388,7 @@ def trade_result(trade):
 
 
 # ====================== الرسائل ======================
-def send_signal(symbol, trade, rsi, diff, yesterday, today, ticker24h, eid, cmc):
+def send_signal(symbol, trade, rsi, diff, yesterday, today, ticker24h, eid, cmc, stoch=None):
     price, stop = trade["entry"], trade["stop"]
     emoji, name = ("🟢", "شراء (Long)") if trade["side"] == "long" else ("🔴", "بيع (Short)")
     rr = (max(TP_TARGETS) / STOP_LOSS_PERCENT) if (STOP_LOSS_PERCENT and TP_TARGETS) else 0
@@ -330,8 +414,10 @@ def send_signal(symbol, trade, rsi, diff, yesterday, today, ticker24h, eid, cmc)
     p.append("• ⚖️ المخاطرة/العائد (لآخر هدف): 1:{:.2g}".format(rr))
 
     p += ["\n📈 <b>المؤشرات</b>",
-          "• RSI: {:.2f} ({})".format(rsi, rsi_state(rsi)),
-          "• الاتجاه اليومي: {}".format(trend),
+          "• RSI: {:.2f} ({})".format(rsi, rsi_state(rsi))]
+    if stoch:
+        p.append("• Stoch RSI: %K {:.1f} / %D {:.1f}".format(stoch[0], stoch[1]))
+    p += ["• الاتجاه اليومي: {}".format(trend),
           "• تغيّر اليوم: {:+.2f}% (أمس <code>{:.6g}</code> ← اليوم <code>{:.6g}</code>)".format(
               diff * 100, yesterday, today)]
 
@@ -498,7 +584,8 @@ def main():
 
     for s in symbols:
         STATES[s] = {"buying": None, "last_signal": None, "trade": None,
-                     "fails": 0, "disabled": False, "pref_eid": None}
+                     "fails": 0, "disabled": False, "pref_eid": None, "last_sig_ts": 0,
+                     "cmc": None, "cmc_ts": 0}
 
     print("بدأ تشغيل البوت | عملات:", len(symbols), "| منصات:", ",".join(e[0] for e in exchanges))
     send_telegram(welcome_text(symbols, [e[0] for e in exchanges]))
@@ -531,6 +618,9 @@ def main():
                 rsi = compute_rsi(cr, RSI_LENGTH)
                 if rsi is None:
                     continue
+                stoch = compute_stoch_rsi(cr, STOCH_RSI_LENGTH, STOCH_LENGTH,
+                                          STOCH_SMOOTH_K, STOCH_SMOOTH_D)
+                stoch_k = stoch[0] if stoch else None
                 diff, yesterday, today = data["diff"], data["yesterday"], data["today"]
                 price, eid, ex = closes[-1], data["eid"], data["ex"]
 
@@ -543,15 +633,19 @@ def main():
                 short_cond = USE_SHORT_FILTER and st["buying"] is False and rsi < 70
                 signal = "long" if long_cond else "short" if short_cond else None
 
-                # إشارة دخول جديدة
-                if signal and signal != st["last_signal"]:
-                    if st["trade"] and st["trade"]["open"]:
-                        st["trade"]["open"] = False
-                        record_outcome(symbol, st["trade"]["side"], trade_result(st["trade"]))
-                    st["trade"] = build_trade(signal, price)
-                    send_signal(symbol, st["trade"], rsi, diff, yesterday, today,
-                                fetch_24h(ex, symbol), eid, fetch_cmc(symbol.split("/")[0]))
-                    st["last_signal"] = signal
+                # إشارة دخول جديدة (مع كل الفلاتر)
+                cooled = (time.time() - st.get("last_sig_ts", 0)) >= SIGNAL_COOLDOWN_HOURS * 3600
+                no_open = not (st["trade"] and st["trade"]["open"])
+                if (signal and signal != st["last_signal"] and cooled and no_open
+                        and stoch_in_range(stoch_k)):
+                    cmc = get_cmc_cached(symbol.split("/")[0], st)
+                    mc = cmc.get("market_cap") if cmc else None
+                    if market_cap_in_range(mc):
+                        st["trade"] = build_trade(signal, price)
+                        send_signal(symbol, st["trade"], rsi, diff, yesterday, today,
+                                    fetch_24h(ex, symbol), eid, cmc, stoch)
+                        st["last_signal"] = signal
+                        st["last_sig_ts"] = time.time()
 
                 # متابعة الصفقة المفتوحة
                 tr = st["trade"]
