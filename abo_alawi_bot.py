@@ -79,6 +79,10 @@ SIGNAL_COOLDOWN_HOURS = env_float("SIGNAL_COOLDOWN_HOURS", 12.0)
 MARKET_CAP_MIN = env_float("MARKET_CAP_MIN", 0.0)
 MARKET_CAP_MAX = env_float("MARKET_CAP_MAX", 0.0)
 
+# فلتر حجم فوليوم الشمعة الحالية بقيمة عملة التسعير (QUOTE) — 0 = تعطيل الحد
+VOLUME_MIN = env_float("VOLUME_MIN", 0.0)
+VOLUME_MAX = env_float("VOLUME_MAX", 0.0)
+
 # فلتر Stochastic RSI — الإشارة لا تُطلق إلا إذا كان %K بين الحدّين
 STOCH_RSI_MIN = env_float("STOCH_RSI_MIN", 0.0)
 STOCH_RSI_MAX = env_float("STOCH_RSI_MAX", 100.0)
@@ -99,6 +103,25 @@ DISABLE_AFTER_FAILS = env_int("DISABLE_AFTER_FAILS", 3)  # استبعاد الع
 
 STABLECOINS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "BUSD", "USDE",
                "PYUSD", "USDD", "USDS", "GUSD"}
+
+# تصنيفات CoinMarketCap المستبعدة (مطابقة جزئية على وسوم العملة)
+# الافتراضي: عملات المنصات، القمار، الألعاب، أسواق التنبؤات، والـ staking
+EXCLUDE_TAGS = [t.strip().lower() for t in env(
+    "EXCLUDE_TAGS",
+    "exchange,gambling,gaming,play-to-earn,prediction-markets,prediction,staking"
+).split(",") if t.strip()]
+
+
+def has_excluded_tag(tags):
+    """هل العملة تحمل أحد الوسوم المستبعدة؟ (مطابقة جزئية)"""
+    if not EXCLUDE_TAGS or not tags:
+        return False
+    for tag in tags:
+        ts = str(tag).lower()
+        for kw in EXCLUDE_TAGS:
+            if kw in ts:
+                return True
+    return False
 
 TV_EXCHANGE = {"gate": "GATEIO", "gateio": "GATEIO", "mexc": "MEXC",
                "kucoin": "KUCOIN", "okx": "OKX", "bybit": "BYBIT", "binance": "BINANCE"}
@@ -127,23 +150,28 @@ def fetch_cmc_top_symbols(n):
         print("⚠️ SYMBOLS=CMC يتطلب CMC_API_KEY — تم الرجوع لزوج واحد.")
         return ["BTC/" + QUOTE]
     out = []
+    skipped = 0
     try:
+        fetch_limit = min(5000, max(n * 2, n))   # نجلب أكثر لتعويض المستبعَد
         resp = requests.get(
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
-            params={"start": 1, "limit": min(max(n, 1), 5000),
-                    "sort": "market_cap", "convert": CMC_CONVERT},
+            params={"start": 1, "limit": fetch_limit, "sort": "market_cap",
+                    "convert": CMC_CONVERT, "aux": "tags"},
             headers={"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accept": "application/json"},
-            timeout=20)
+            timeout=25)
         for coin in resp.json().get("data", []):
             sym = (coin.get("symbol") or "").upper()
             if not sym or sym in STABLECOINS or sym == QUOTE.upper():
+                continue
+            if has_excluded_tag(coin.get("tags")):
+                skipped += 1
                 continue
             pair = "{}/{}".format(sym, QUOTE)
             if pair not in out:
                 out.append(pair)
             if len(out) >= n:
                 break
-        print("تم جلب {} عملة من CoinMarketCap".format(len(out)))
+        print("تم جلب {} عملة من CoinMarketCap (استُبعد {} بسبب التصنيف)".format(len(out), skipped))
     except Exception as exc:
         print("خطأ جلب قائمة CoinMarketCap:", exc)
     return out or ["BTC/" + QUOTE]
@@ -249,6 +277,19 @@ def market_cap_in_range(mc):
     return True
 
 
+def volume_in_range(v):
+    """هل قيمة فوليوم الشمعة (بعملة التسعير) ضمن الحدّين؟ (0 = تعطيل الحد)"""
+    if VOLUME_MIN <= 0 and VOLUME_MAX <= 0:
+        return True
+    if v is None:
+        return True
+    if VOLUME_MIN > 0 and v < VOLUME_MIN:
+        return False
+    if VOLUME_MAX > 0 and v > VOLUME_MAX:
+        return False
+    return True
+
+
 def get_market_data(exchanges, symbol, timeframe, rsi_length, prefer=None):
     ordered = exchanges
     if prefer:
@@ -261,8 +302,9 @@ def get_market_data(exchanges, symbol, timeframe, rsi_length, prefer=None):
             dcloses = [c[4] for c in daily]
             if len(closes) >= rsi_length + 1 and len(dcloses) >= 2 and dcloses[-2] != 0:
                 y, t = dcloses[-2], dcloses[-1]
+                vol = ohlcv[-1][5] if (ohlcv and len(ohlcv[-1]) > 5) else None
                 return {"closes": closes, "diff": (t - y) / y, "yesterday": y,
-                        "today": t, "eid": eid, "ex": ex}
+                        "today": t, "eid": eid, "ex": ex, "volume": vol}
         except Exception:
             continue
     return None
@@ -408,7 +450,8 @@ def trade_result(trade):
 
 
 # ====================== الرسائل ======================
-def send_signal(symbol, trade, rsi, diff, yesterday, today, ticker24h, eid, cmc, stoch=None):
+def send_signal(symbol, trade, rsi, diff, yesterday, today, ticker24h, eid, cmc, stoch=None,
+                vol_base=None, vol_quote=None):
     price, stop = trade["entry"], trade["stop"]
     emoji, name = ("🟢", "شراء (Long)") if trade["side"] == "long" else ("🔴", "بيع (Short)")
     rr = (max(TP_TARGETS) / STOP_LOSS_PERCENT) if (STOP_LOSS_PERCENT and TP_TARGETS) else 0
@@ -440,6 +483,11 @@ def send_signal(symbol, trade, rsi, diff, yesterday, today, ticker24h, eid, cmc,
     p += ["• الاتجاه اليومي: {}".format(trend),
           "• تغيّر اليوم: {:+.2f}% (أمس <code>{:.6g}</code> ← اليوم <code>{:.6g}</code>)".format(
               diff * 100, yesterday, today)]
+    if vol_base is not None:
+        vline = "• حجم الشمعة الحالية: <code>{}</code> {}".format(human_num(vol_base), base)
+        if vol_quote is not None:
+            vline += " (~ <code>{}</code> {})".format(human_num(vol_quote), QUOTE)
+        p.append(vline)
 
     if ticker24h and (ticker24h.get("high") is not None or ticker24h.get("low") is not None):
         p.append("\n📊 <b>إحصائيات 24 ساعة</b>")
@@ -651,6 +699,8 @@ def main():
                 stoch_k = stoch[0] if stoch else None
                 diff, yesterday, today = data["diff"], data["yesterday"], data["today"]
                 price, eid, ex = closes[-1], data["eid"], data["ex"]
+                vol_base = data.get("volume")
+                vol_quote = (vol_base * price) if vol_base is not None else None
 
                 if diff > THRESHOLD:
                     st["buying"] = True
@@ -665,13 +715,13 @@ def main():
                 cooled = (time.time() - st.get("last_sig_ts", 0)) >= SIGNAL_COOLDOWN_HOURS * 3600
                 no_open = not (st["trade"] and st["trade"]["open"])
                 if (signal and signal != st["last_signal"] and cooled and no_open
-                        and stoch_in_range(stoch_k)):
+                        and stoch_in_range(stoch_k) and volume_in_range(vol_quote)):
                     cmc = get_cmc_cached(symbol.split("/")[0], st)
                     mc = cmc.get("market_cap") if cmc else None
                     if market_cap_in_range(mc):
                         st["trade"] = build_trade(signal, price)
                         send_signal(symbol, st["trade"], rsi, diff, yesterday, today,
-                                    fetch_24h(ex, symbol), eid, cmc, stoch)
+                                    fetch_24h(ex, symbol), eid, cmc, stoch, vol_base, vol_quote)
                         st["last_signal"] = signal
                         st["last_sig_ts"] = time.time()
 
