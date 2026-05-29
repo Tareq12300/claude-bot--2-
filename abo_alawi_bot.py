@@ -21,6 +21,7 @@
   CHECK_INTERVAL       ثواني بين كل فحص                     (افتراضي: 300)
   THRESHOLD RSI_LENGTH STOP_LOSS_PERCENT TP_TARGETS USE_LONG_FILTER USE_SHORT_FILTER
   CAPITAL QUOTE TIMEZONE CMC_API_KEY CMC_CONVERT
+  USE_RSI_FILTER       تفعيل فلتر RSI العادي (false = Stoch RSI فقط) (افتراضي: true)
 
 ▼ فلتر نسبة الفوليوم (Volume Ratio):
   VOLUME_RATIO_MIN     أقل نسبة (فوليوم الشمعة ÷ المتوسط)   (افتراضي: 0 = تعطيل)
@@ -76,6 +77,9 @@ STOP_LOSS_PERCENT = env_float("STOP_LOSS_PERCENT", 20.0)
 TP_TARGETS = sorted(float(x) for x in env("TP_TARGETS", "20,40,60").split(",") if x.strip())
 USE_LONG_FILTER  = env_bool("USE_LONG_FILTER", True)
 USE_SHORT_FILTER = env_bool("USE_SHORT_FILTER", True)
+# تفعيل فلتر RSI العادي (شراء فقط إذا RSI>30 / بيع فقط إذا RSI<70).
+#   ضعه false إذا أردت الاعتماد على Stoch RSI فقط وتجاهل RSI العادي.
+USE_RSI_FILTER = env_bool("USE_RSI_FILTER", True)
 USE_CLOSED_CANDLE_ONLY = env_bool("USE_CLOSED_CANDLE_ONLY", True)
 # أقل مدة (بالساعات) بين إشارتين لنفس العملة — لتقليل كثرة الإشارات
 SIGNAL_COOLDOWN_HOURS = env_float("SIGNAL_COOLDOWN_HOURS", 12.0)
@@ -761,8 +765,10 @@ def main():
                 elif diff < -THRESHOLD:
                     st["buying"] = False
 
-                long_cond  = USE_LONG_FILTER  and st["buying"] is True  and rsi > 30
-                short_cond = USE_SHORT_FILTER and st["buying"] is False and rsi < 70
+                rsi_long_ok  = (rsi > 30) if USE_RSI_FILTER else True
+                rsi_short_ok = (rsi < 70) if USE_RSI_FILTER else True
+                long_cond  = USE_LONG_FILTER  and st["buying"] is True  and rsi_long_ok
+                short_cond = USE_SHORT_FILTER and st["buying"] is False and rsi_short_ok
                 signal = "long" if long_cond else "short" if short_cond else None
 
                 # إشارة دخول جديدة (مع كل الفلاتر)
