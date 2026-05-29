@@ -339,14 +339,34 @@ def tradingview_url(eid, symbol):
     return "https://www.tradingview.com/chart/?symbol={}:{}".format(market, symbol.replace("/", ""))
 
 
-def send_telegram(text, reply_markup=None):
+_LAST_SEND = [0.0]   # آخر وقت إرسال (للتهدئة)
+
+
+def send_telegram(text, reply_markup=None, _retries=3):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text,
                "parse_mode": "HTML", "disable_web_page_preview": True}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
+    # تهدئة: ثانية واحدة على الأقل بين كل رسالتين (حد تليجرام لكل محادثة)
+    gap = time.time() - _LAST_SEND[0]
+    if gap < 1.1:
+        time.sleep(1.1 - gap)
     try:
-        requests.post("https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_BOT_TOKEN),
-                      data=payload, timeout=15).raise_for_status()
+        r = requests.post("https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_BOT_TOKEN),
+                          data=payload, timeout=20)
+        _LAST_SEND[0] = time.time()
+        if r.status_code == 429:
+            retry_after = 3
+            try:
+                retry_after = int(r.json().get("parameters", {}).get("retry_after", 3))
+            except Exception:
+                pass
+            print("تليجرام 429 — الانتظار {} ثانية".format(retry_after))
+            time.sleep(retry_after + 1)
+            if _retries > 0:
+                return send_telegram(text, reply_markup, _retries - 1)
+            return
+        r.raise_for_status()
     except Exception as exc:
         print("خطأ في إرسال رسالة تليجرام:", exc)
 
